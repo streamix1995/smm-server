@@ -3,24 +3,22 @@ const express = require('express');
 const app = express();
 const path = require('path');
 const multer = require('multer');
-const cors = require('cors'); // إضافة الربط مع الموقع الأساسي
-const { Pool } = require('pg'); // إضافة قاعدة البيانات
+const cors = require('cors'); 
+const { Pool } = require('pg'); 
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 
-// السماح باستقبال الطلبات من أي دومين (عشان اللاندنج بيج الأساسية تعرف تكلمه)
 app.use(cors({ origin: '*' }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' })); // زودنا الليميت عشان صور Base64
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 app.use(express.static(path.join(__dirname)));
+// مبقناش محتاجين مجلد uploads لأن الصور هتتحفظ في الداتابيز، بس هنسيب السطر ده احتياطي
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-// إعداد اتصال قاعدة بيانات Neon (نفس قاعدة مشروعك الأساسي)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
-// إنشاء جدول طلبات SMM لو مش موجود
 async function initDb() {
     try {
         await pool.query(`
@@ -46,33 +44,21 @@ async function initDb() {
 }
 initDb();
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        const uploadDir = path.join(__dirname, 'uploads');
-        const fs = require('fs');
-        if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-        cb(null, uploadDir);
-    },
-    filename: (req, file, cb) => {
-        cb(null, Date.now() + path.extname(file.originalname));
-    }
-});
+// 💡 التعديل الأول: استخدام الميموري بدل المجلد عشان الصورة متتمسحش أبداً
+const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
 const apiKey = '9aa5c38e80647507e652757543d475c9'; 
 const apiUrl = 'https://justanotherpanel.com/api/v2';
 
-// أسعار الصرف الدقيقة مقابل الدولار
 const exchangeRates = { USD: 1, EGP: 50, SAR: 3.75, AED: 3.67, KWD: 0.31, QAR: 3.64 };
 
-// أسعار التكلفة الفعلية الثابتة لكل 1000 وحدة (لمنع أخطاء الصفر والتأخير)
 const baseCostPricesUSD = {
-    '10380': 3.00, // متابعين
-    '10023': 0.60, // لايكات
-    '8526': 0.03   // مشاهدات
+    '10380': 3.00, 
+    '10023': 0.60, 
+    '8526': 0.03   
 };
 
-// سحب الأسعار وإضافة 50% ربح
 app.get('/api/services', async (req, res) => {
     try {
         const params = new URLSearchParams();
@@ -101,15 +87,21 @@ app.get('/api/services', async (req, res) => {
     }
 });
 
-// استقبال الطلب وحفظه في قاعدة البيانات
+// 💡 التعديل التاني: تحويل الصورة لـ Base64 وحفظها كنص في الداتابيز
 app.post('/api/order', upload.single('receiptImage'), async (req, res) => {
     const { fullName, service, link, quantity, totalPrice, currency = 'EGP' } = req.body;
     
     let qty = parseInt(quantity) || 0;
     let paidAmount = parseFloat(totalPrice) || 0;
-    let receiptImage = req.file ? `/uploads/${req.file.filename}` : '';
+    
+    let receiptImage = '';
+    if (req.file) {
+        // تحويل الصورة لنص Base64
+        const base64Image = req.file.buffer.toString('base64');
+        const mimeType = req.file.mimetype;
+        receiptImage = `data:${mimeType};base64,${base64Image}`;
+    }
 
-    // حساب التكلفة والربح بشكل ثابت ودقيق
     let ratePerThousandUSD = baseCostPricesUSD[service] || 3.00;
     let actualCostUSD = (qty * ratePerThousandUSD) / 1000;
 
@@ -134,7 +126,6 @@ app.post('/api/order', upload.single('receiptImage'), async (req, res) => {
     }
 });
 
-// الموافقة على الطلب وتحديث حالته في قاعدة البيانات
 app.post('/api/admin/approve-order', async (req, res) => {
     const { orderId } = req.body;
     
@@ -174,11 +165,9 @@ app.post('/api/admin/approve-order', async (req, res) => {
     }
 });
 
-// جلب الطلبات للوحة التحكم من قاعدة البيانات
 app.get('/api/admin/data', async (req, res) => {
     try {
         const dbRes = await pool.query('SELECT * FROM smm_orders ORDER BY created_at DESC');
-        // تحويل أسماء الأعمدة للصيغة اللي واجهة الأدمن القديمة بتاعتك فاهماها
         const orders = dbRes.rows.map(r => ({
             id: r.id,
             fullName: r.full_name,
@@ -196,6 +185,27 @@ app.get('/api/admin/data', async (req, res) => {
         res.json({ orders });
     } catch (err) {
         res.status(500).json({ message: 'خطأ في جلب البيانات' });
+    }
+});
+
+// 💡 التعديل التالت: برمجة مسار الحذف المربوط بلوحة التحكم
+app.delete('/api/admin/order/:id', async (req, res) => {
+    // حماية إضافية: التأكد إن الطلب جاي من لوحة التحكم بمفتاح الإدارة
+    const adminKey = req.headers['x-admin-key'];
+    if (adminKey !== 'streamix_admin') {
+        return res.status(401).json({ message: 'غير مصرح بحذف الطلبات' });
+    }
+
+    const orderId = String(req.params.id);
+    try {
+        const deleteRes = await pool.query('DELETE FROM smm_orders WHERE id = $1', [orderId]);
+        if (deleteRes.rowCount === 0) {
+            return res.status(404).json({ message: 'الطلب غير موجود أو تم حذفه مسبقاً' });
+        }
+        res.json({ success: true, message: 'تم حذف الطلب نهائياً 🗑️' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'خطأ في حذف الطلب من قاعدة البيانات' });
     }
 });
 
